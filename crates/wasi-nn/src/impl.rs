@@ -2,7 +2,7 @@
 use crate::ctx::{ExecutionContext, WasiNnResult as Result};
 use crate::witx::types::{
     ExecutionTarget, Graph, GraphBuilderArray, GraphEncoding, GraphExecutionContext, Tensor,
-    TensorType,
+    TensorType,CiovecArray,Ciovec, IovecArray, Iovec,
 };
 use crate::witx::wasi_ephemeral_nn::WasiEphemeralNn;
 use crate::WasiNnCtx;
@@ -25,6 +25,50 @@ pub enum UsageError {
 }
 
 impl<'a> WasiEphemeralNn for WasiNnCtx {
+    fn load_as<'b>(
+        &self,
+        xml: &CiovecArray<'_>,
+        weights: &CiovecArray<'_>,
+        encoding: GraphEncoding,
+        target: ExecutionTarget,
+    ) -> Result<Graph> {
+        if encoding != GraphEncoding::Openvino {
+            return Err(UsageError::InvalidEncoding(encoding).into());
+        }
+       
+        let mut xml_vec = Vec::new();
+        let xml_ciovec = xml.as_ptr().read()?;
+
+        for i in 0..xml_ciovec.buf_len {
+            xml_vec.push(xml_ciovec.buf.add(i)?.read()?);
+        }
+
+        let mut weights_vec = Vec::new();
+        let weights_ciovec = weights.as_ptr().read()?;
+
+        for i in 0..weights_ciovec.buf_len {
+            weights_vec.push(weights_ciovec.buf.add(i)?.read()?);
+        }
+
+        let graph = self
+            .ctx
+            .borrow_mut()
+            .core
+            .read_network_from_buffer(&xml_vec, &weights_vec)?;
+        let executable_graph = self
+            .ctx
+            .borrow_mut()
+            .core
+            .load_network(&graph, map_execution_target_to_string(target))?;
+        let id = self
+            .ctx
+            .borrow_mut()
+            .graphs
+            .insert((graph, executable_graph));
+        
+        Ok(id)
+    }
+
     fn load<'b>(
         &self,
         builders: &GraphBuilderArray<'_>,
@@ -117,12 +161,111 @@ impl<'a> WasiEphemeralNn for WasiNnCtx {
         Ok(())
     }
 
+    fn set_input_as<'b>(
+        &self,
+        context: GraphExecutionContext,
+        index: u32,
+        dimensions: &IovecArray<'_>,
+        tensortype: TensorType,
+        data: &IovecArray<'_>,
+    ) -> Result<()> {
+        let graph = if let Some(execution) = self.ctx.borrow_mut().executions.get_mut(context) {
+            execution.graph
+        } else {
+            return Err(UsageError::InvalidExecutionContextHandle.into());
+        };
+
+        let input_name = if let Some((graph, _)) = self.ctx.borrow().graphs.get(graph) {
+            graph.get_input_name(index as usize)?
+        } else {
+            unreachable!("It should be impossible to attempt to access an execution's graph and for that graph not to exist--this is a bug.")
+        };
+
+        let mut dimensions_vec = Vec::new();
+        let dimensions_iovec = dimensions.as_ptr().read()?;
+
+        for i in 0..dimensions_iovec.buf_len {
+            dimensions_vec.push(dimensions_iovec.buf.add(i)?.read()?);
+        }
+
+        let mut data_vec = Vec::new();
+        let data_iovec = data.as_ptr().read()?;
+
+        for i in 0..data_iovec.buf_len {
+            data_vec.push(data_iovec.buf.add(i)?.read()?);
+        }
+
+        let dimension_iter = dimensions_vec.iter().map(|d| *d as u64).collect::<Vec<_>>();
+
+        let precision = match tensortype {
+                TensorType::F16 => Precision::FP16,
+                TensorType::F32 => Precision::FP32,
+                TensorType::U8 => Precision::U8,
+                TensorType::I32 => Precision::I32,
+            };
+        
+        // // TODO There must be some good way to discover the layout here; this should not have to default to NHWC.
+        let desc = TensorDesc::new(Layout::NHWC, &dimension_iter, precision);
+        let blob = openvino::Blob::new(desc, &data_vec)?;
+        
+        // // Actually assign the blob to the request (TODO avoid duplication with the borrow above).
+        if let Some(execution) = self.ctx.borrow_mut().executions.get_mut(context) {
+            execution.request.set_blob(&input_name, blob)?;
+        } else {
+            return Err(UsageError::InvalidExecutionContextHandle.into());
+        }
+        Ok(())
+    }
+
     fn compute(&self, context: GraphExecutionContext) -> Result<()> {
         if let Some(execution) = self.ctx.borrow_mut().executions.get_mut(context) {
             Ok(execution.request.infer()?)
         } else {
             return Err(UsageError::InvalidExecutionContextHandle.into());
         }
+    }
+
+    fn get_output_as<'b>(
+        &self,
+        context: GraphExecutionContext,
+        index: u32,
+        out_buffer: &IovecArray<'_>,
+        out_buffer_max_size: u32,
+    ) -> Result<u32> {
+        let graph = if let Some(execution) = self.ctx.borrow_mut().executions.get_mut(context) {
+            execution.graph
+        } else {
+            return Err(UsageError::InvalidExecutionContextHandle.into());
+        };
+
+        let output_name = if let Some((graph, _)) = self.ctx.borrow().graphs.get(graph) {
+            graph.get_output_name(index as usize)?
+        } else {
+            unreachable!("It should be impossible to attempt to access an execution's graph and for that graph not to exist--this is a bug.")
+        };
+
+        let mut out_buffer_vec = Vec::new();
+        let out_buffer_iovec = out_buffer.as_ptr().read()?;
+
+        for i in 0..out_buffer_iovec.buf_len {
+            out_buffer_vec.push(out_buffer_iovec.buf.add(i)?.read()?);
+        }
+
+        // Retrieve the tensor data.
+        let (mut blob, blob_size) =
+            if let Some(execution) = self.ctx.borrow_mut().executions.get_mut(context) {
+                let mut blob = execution.request.get_blob(&output_name)?; // TODO shouldn't need to be mut
+                let blob_size = blob.byte_len()? as u32;
+                if blob_size > out_buffer_max_size {
+                    return Err(UsageError::NotEnoughMemory(blob_size).into());
+                }
+                (blob, blob_size)
+            } else {
+                return Err(UsageError::InvalidExecutionContextHandle.into());
+            };
+             
+        &out_buffer_iovec.buf.as_array(blob_size).copy_from_slice(blob.buffer()?);
+        Ok(blob_size)
     }
 
     fn get_output<'b>(
